@@ -10,15 +10,15 @@ The extension features:
 
 - Live preview on edits.
 
-![Live preview on edits](docs/images/sshot-preview.png)
+![Live preview on edits](https://github.com/atsushieno/vscode-language-review/raw/HEAD/docs/images/sshot-preview.png)
 
 - Diagnostic reports on save and preview. If you would also like proof-reading helper, use [vscode-prh-extension](https://github.com/prh/vscode-prh-extention).
 
-![Diagnostic reports on save and preview](docs/images/sshot-diagnostic.png)
+![Diagnostic reports on save and preview](https://github.com/atsushieno/vscode-language-review/raw/HEAD/docs/images/sshot-diagnostic.png)
 
 - List document sections and jump to them.
 
-![List document sections and jump to them](docs/images/sshot-structure.png)
+![List document sections and jump to them](https://github.com/atsushieno/vscode-language-review/raw/HEAD/docs/images/sshot-structure.png)
 
 # How to Build and Run when debugging this extension
 
@@ -33,7 +33,7 @@ Check out [github issues](https://github.com/atsushieno/vscode-language-review/i
 
 # License
 
-The primary license is MIT (see [LICENSE.md](LICENSE.md)). Note that this repository and the extension binary package also contain third-party sources, namely:
+The primary license is MIT (see [LICENSE.md](https://github.com/atsushieno/vscode-language-review/blob/HEAD/LICENSE.md)). Note that this repository and the extension binary package also contain third-party sources, namely:
 
 - syntaxes/review.tmLanguage is taken from [yanzm/ReVIEW](https://github.com/yanzm/ReVIEW), Apache License Version 2.0
 - review.js-vscode, packaged in the binary distribution of this extension, is taken from [yfakariya/review.js-vscode](https://github.com/yfakariya/review.js-vscode) which is a fork of [vvakame/review.js](https://github.com/vvakame/review.js), MIT License.

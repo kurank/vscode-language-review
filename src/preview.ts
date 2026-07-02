@@ -1,447 +1,148 @@
-'use strict';
+"use strict";
 
-import * as fs from 'fs';
-import * as path from 'path';
-import * as vscode from 'vscode';
-import * as review from 'review.js-vscode';
-import * as jsyaml from "js-yaml";
-import { ConfigBook } from 'review.js-vscode/lib/controller/configRaw';
-import { NodeSyntaxTree } from 'review.js-vscode';
+import * as vscode from "vscode";
+import * as path from "path";
+import * as fs from "fs";
+import { execFile } from "child_process";
+import { promisify } from "util";
 
-const review_scheme = "review";
+const execFileAsync = promisify(execFile);
 
-class ReviewSymbolProvider implements vscode.DocumentSymbolProvider, vscode.Disposable {
+const WEBROOT = "webroot"; // review-webmaker のデフォルト出力先
 
-	public constructor () {}
-
-	public provideDocumentSymbols(document: vscode.TextDocument, token: vscode.CancellationToken): vscode.SymbolInformation[] | Thenable<vscode.DocumentSymbol[]>
-	{
-		// FIXME: uncomment this and get it working
-		// (it does not, because it is most likely invoked way before processDocument() completes and updates the symbols).
-		// This should not trigger processDocument every time vscode requests symbols (it invokes this method for every change)
-		//if (document_symbols == null)
-			return processDocument (document).then (_ => document_symbols, _ => document_symbols);
-		//else
-		//	Promise.resolve (document_symbols);
-	}
-
-	public dispose ()
-	{
-	}
+function getConfigPath(docDir: string): string | null {
+  const inDocDir = path.join(docDir, "config.yml");
+  if (fs.existsSync(inDocDir)) return inDocDir;
+  const inSrc = path.join(docDir, "..", "config.yml");
+  if (fs.existsSync(inSrc)) return path.resolve(inSrc);
+  const folders = vscode.workspace.workspaceFolders;
+  if (folders?.length) {
+    const inRoot = path.join(folders[0].uri.fsPath, "src", "config.yml");
+    if (fs.existsSync(inRoot)) return inRoot;
+  }
+  return null;
 }
 
-interface Configuration {
-	readonly draftMode: boolean;
-	readonly styleSheet: string;
+function getHtmlext(docDir: string): string {
+  const configPath = getConfigPath(docDir);
+  if (!configPath) return "xhtml";
+  try {
+    const yaml = fs.readFileSync(configPath, "utf8");
+    const m = yaml.match(/^\s*htmlext:\s*(\S+)/m);
+    return m ? m[1].trim() : "xhtml";
+  } catch {
+    return "xhtml";
+  }
 }
 
-function getConfiguration () : Configuration {
-	// Specify first segment of properties which is defined in package.json/contributes/configuration
-	const vsconfig = vscode.workspace.getConfiguration ("languageReview");
-
-	// Specify remaining segments of properties here:
-	return {
-		draftMode: vsconfig.get<boolean> ("preview.draftMode") ?? false,
-		styleSheet: vsconfig.get<string> ("preview.stylesheet") ?? "stylesheet.css",
-	}
+async function buildOneWithWebmaker(
+  docDir: string,
+  reFileName: string,
+  configPath: string,
+): Promise<{ stdout: string; stderr: string }> {
+  const only = path.basename(reFileName, ".re");
+  const configBasename = path.basename(configPath);
+  const configDir = path.dirname(configPath);
+  // review-webmaker は config のあるディレクトリで実行する
+  return execFileAsync(
+    "review-webmaker",
+    ["-y", `${only}.re`, configBasename],
+    { cwd: configDir, maxBuffer: 4 * 1024 * 1024 },
+  );
 }
 
-function convert_review_doc_to_html (document: vscode.TextDocument, getAssetUri: (...relPath: string[]) => vscode.Uri): Promise<string> {
-	const docFileName = path.basename(document.fileName);
+export function activate(context: vscode.ExtensionContext): void {
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "review.showPreview",
+      async (uri?: vscode.Uri) => {
+        const doc = uri
+          ? vscode.workspace.textDocuments.find(
+              (d) => d.uri.fsPath === uri.fsPath,
+            )
+          : vscode.window.activeTextEditor?.document;
+        if (!doc || path.extname(doc.fileName) !== ".re") {
+          vscode.window.showErrorMessage(
+            "Re:VIEW の .re ファイルを開いてからプレビューを実行してください。",
+          );
+          return;
+        }
 
-	return new Promise<string> ((resolve, rejected) => {
-		var styleFile = path.join(path.dirname(document.fileName), 'style.css');
-		var getStyleTag = (): string => `<link rel="stylesheet" type="text/css" href="${getAssetUri(styleFile)}">`;
+        const docDir = path.dirname(doc.fileName);
+        const reFileName = path.basename(doc.fileName);
+        const configPath = getConfigPath(docDir);
+        if (!configPath) {
+          vscode.window.showErrorMessage(
+            "config.yml が見つかりません。.re と同じディレクトリか src/ に配置してください。",
+          );
+          return;
+        }
 
-		processDocument (document).then (
-			buffer => {
-				var result = "";
-				buffer.allChunks.filter (c => c.name === docFileName).forEach (chunk => chunk.builderProcesses.forEach (proc => result += proc.result));
-				if (result == "")
-					result = "Start writing Re:VIEW content with '= title' (top level header). Or if you have written contents but seeing this, check syntax errors.";
-				if (!result.startsWith ("<html") && !result.startsWith ("<!DOCTYPE")) {
-					// Uses basename to prevent directory traversal
-					const styleSheetUri = path.join (path.dirname (document.fileName), path.basename (getConfiguration ().styleSheet));
-					if (fs.existsSync (styleSheetUri)) {
-						const css = fs.readFileSync (styleSheetUri, "utf-8")
-						result = `<html><head><base href="${getAssetUri(document.fileName)}" /><style type="text/css"><!--\n ${css} \n--></style></head><body>${result}</body></html>`;
-					} else {
-						result = `<html><head><base href="${getAssetUri(document.fileName)}" />${getStyleTag()}</head><body>${result}</body></html>`;
-					}
-				}
-				return resolve (result);
-			},
-			reason => rejected (reason)
-		);
-	});
+        const panel = vscode.window.createWebviewPanel(
+          "review-preview",
+          `[preview] ${reFileName}`,
+          vscode.ViewColumn.Two,
+          {
+            enableScripts: true,
+            localResourceRoots: [
+              vscode.Uri.file(path.join(path.dirname(configPath), WEBROOT)),
+            ],
+          },
+        );
+
+        panel.webview.html = "<html><body><p>ビルド中…</p></body></html>";
+
+        try {
+          await buildOneWithWebmaker(docDir, reFileName, configPath);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const stderr =
+            err && typeof err === "object" && "stderr" in err
+              ? String((err as { stderr: string }).stderr)
+              : "";
+          panel.webview.html = [
+            "<html><body><h1>ビルドエラー</h1>",
+            '<pre style="white-space:pre-wrap;">',
+            escapeHtml(msg + (stderr ? "\n\n" + stderr : "")),
+            "</pre></body></html>",
+          ].join("");
+          return;
+        }
+
+        const configDir = path.dirname(configPath);
+        const webrootPath = path.join(configDir, WEBROOT);
+        const baseName = path.basename(reFileName, ".re");
+        const htmlext = getHtmlext(docDir);
+        const htmlPath = path.join(webrootPath, `${baseName}.${htmlext}`);
+
+        if (!fs.existsSync(htmlPath)) {
+          panel.webview.html = [
+            "<html><body><h1>プレビューエラー</h1>",
+            "<p>生成ファイルが見つかりません: " + escapeHtml(htmlPath) + "</p>",
+            "</body></html>",
+          ].join("");
+          return;
+        }
+
+        let html = fs.readFileSync(htmlPath, "utf8");
+        const baseHref = panel.webview
+          .asWebviewUri(vscode.Uri.file(webrootPath))
+          .toString()
+          .replace(/\/?$/, "/");
+        if (!/<base\s/i.test(html)) {
+          html = html.replace(/<head\s*>/i, `<head><base href="${baseHref}">`);
+        }
+
+        panel.webview.html = html;
+      },
+    ),
+  );
 }
 
-function reportLevelToSeverity (level: review.ReportLevel): vscode.DiagnosticSeverity {
-	switch (level) {
-		case review.ReportLevel.Error: return vscode.DiagnosticSeverity.Error;
-		case review.ReportLevel.Info: return vscode.DiagnosticSeverity.Information;
-		case review.ReportLevel.Warning: return vscode.DiagnosticSeverity.Warning;
-	}
-	return vscode.DiagnosticSeverity.Information;
-}
-
-function locationToRange (loc: review.Location): vscode.Range {
-	return new vscode.Range (
-		new vscode.Position (loc.start.line - 1, loc.start.column - 1),
-		new vscode.Position (loc.end.line - 1, loc.end.column - 1));
-}
-
-var document_symbols: vscode.DocumentSymbol[] = null;
-var last_diagnostics: vscode.DiagnosticCollection = null;
-
-interface ReviewSymbol {
-	readonly level: number;
-	readonly parent: ReviewSymbol | undefined;
-	readonly children: vscode.DocumentSymbol[]
-}
-
-function maybeProcessDocument (document: vscode.TextDocument): Promise<review.Book> {
-	if (document.uri.scheme != review_scheme)
-		return;
-	return processDocument (document);
-}
-
-function processDocument (document: vscode.TextDocument): Promise<review.Book> {
-	var getEOLPosition = (line: number): vscode.Position => document.lineAt (line).range.end;
-
-	function getPositionJustBefore (pos: vscode.Position): vscode.Position {
-		if (pos.line === 0 && pos.character === 0) {
-			return new vscode.Position (0, 0);
-		}
-		return pos.character === 0 ? getEOLPosition (pos.line - 1) : new vscode.Position (pos.line, pos.character - 1);
-	}
-
-	function getChapters (catalogYaml: any | null): ConfigBook | null {
-		if (catalogYaml == null) {
-			return null;
-		}
-
-		const getStringArray =
-			function (obj: any, propertyName: string): string[] {
-				const property = obj [propertyName];
-				if (Array.isArray (property)) {
-					const result = <string[]>[];
-					for(const item of property) {
-						if (item == null) {
-							continue;
-						} else if (typeof item === 'string') {
-							// chapter
-							result.push (item);
-						} else {
-							// part
-							for(const partName in item) {
-								const part = item [partName];
-								for(const chapter of part) {
-									result.push (chapter);
-								}
-							}
-						}
-					}
-					return result;
-				} else if (typeof property === "object") {
-					let result = <string[]>[];
-					for (const p in property) {
-						result = result.concat (getStringArray (property, p));
-					}
-					return result;
-				} else if (property != null) {
-					return [property.toString ()];
-				}
-
-				return [];
-			};
-
-		return {
-			predef: getStringArray (catalogYaml, "predef").concat (getStringArray (catalogYaml, "PREDEF")).map (f => ({ file: f })),
-			contents: getStringArray (catalogYaml, "contents").concat (getStringArray (catalogYaml, "CHAPS")).map (f => ({ file: f })),
-			appendix: getStringArray (catalogYaml, "appendix").concat (getStringArray (catalogYaml, "APPENDIX")).map (f => ({ file: f })),
-			postdef: getStringArray (catalogYaml, "postdef").concat (getStringArray (catalogYaml, "POSTDEF")).map (f => ({ file: f }))
-		};
-	}
-
-	const options = {
-		draft: getConfiguration().draftMode,
-		inproc: true
-	};
-
-	return review.start (controller => {
-		var prhFile = path.join (path.dirname (document.fileName), "prh.yml");
-		var validators: review.Validator[];
-		validators = [new review.DefaultValidator()];
-
-		const docFileName = path.basename (document.fileName);
-		const docDirName = path.dirname (document.fileName);
-
-		const catalogYamlFileName = path.resolve (docDirName, "catalog.yml");
-		const books =
-			fs.existsSync (catalogYamlFileName) ?
-				getChapters (jsyaml.load (fs.readFileSync (catalogYamlFileName, "utf8"))) :
-				{
-					predef: [],
-					contents: [],
-					appendix: [],
-					postdef: []
-				};
-		if (books.predef.findIndex (x => x.file === docFileName) < 0 &&
-			books.contents.findIndex (x => {
-				if (typeof x === "string") {
-					return x === docFileName;
-				} else {
-					return x.file === docFileName;
-				}
-			}
-			) < 0 &&
-			books.appendix.findIndex (x => x.file === docFileName) < 0 &&
-			books.postdef.findIndex (x => x.file === docFileName) < 0) {
-			books.contents.push (<any>{ file: docFileName });
-		}
-
-		controller.initConfig ({
-			basePath: path.dirname (document.fileName),
-			validators: validators,
-			read: fileName =>
-				fileName === docFileName ?
-					Promise.resolve (document.getText ()) :
-					Promise.resolve (fs.readFileSync (path.resolve (docDirName, fileName), "utf8")),
-			write: (path, data) => Promise.resolve (void {}),
-			listener: {
-				// onAcceptables: ... ,
-				onSymbols: function (symbols) {
-					function organizeSymbols (parent: ReviewSymbol, symbols: review.Symbol[]) {
-						if (!symbols.length) {
-							return;
-						}
-
-						let symbol = symbols[0];
-						// Uses `detail` to distinguish columns from headlines.
-						// It's a bit dirty hack but it's needed to avoid 2-pass scan.
-						// Uutilizing vscode.SymbolKind is an alternative but cannot fill a concept gap anyway.
-						let docSymbol = new vscode.DocumentSymbol (
-							getLabelName (symbol), getLabelDetail (symbol), vscode.SymbolKind.Null, locationToRange (symbol.node.location), locationToRange (symbol.node.location));
-						let level = extractLevel (symbol);
-						if (docSymbol === undefined || level === -Infinity) {
-							return;
-						}
-						if (docSymbol.detail === 'column') {
-							// Adjust column ending position because review.js returns the one overlaps with the next element.
-							docSymbol.range = new vscode.Range (docSymbol.range.start, getPositionJustBefore (docSymbol.range.end));
-						}
-						docSymbol.children = [];
-						while (parent && level <= parent.level) {
-							parent = parent.parent!;
-							// Adjust end marker on level change
-							if (parent.children.length !== 0) {
-								let lastChild = parent.children[parent.children.length - 1];
-								// columns themselves have correct end markers so DON'T perform adjustment
-								if (lastChild.detail !== 'column') {
-									lastChild.range = new vscode.Range (lastChild.range.start, getPositionJustBefore (docSymbol.range.start));
-								}
-							}
-						}
-						parent.children.push (docSymbol);
-						organizeSymbols ({level, children: docSymbol.children, parent}, symbols.slice (1));
-						if (symbols.length === 1) {
-							// symbols exhausted. i.e. document ended. Put `end` markers for all "opened" DocumentSymbols for building Breadcrumbs.
-							let endOfDocumentPos = getEOLPosition (document.lineCount - 1);
-							// First, adjust range of the last symbol because non-column symbols don't have correct ending positions yet.
-							if (getLabelDetail (symbol) !== 'column') {
-								docSymbol.range = new vscode.Range (docSymbol.range.start, endOfDocumentPos);
-							}
-							// Then, propagate ending position to ancestors.
-							var p = parent;
-							while (p.parent !== undefined) {
-								let lastElem = p.parent!.children[p.parent!.children.length - 1];
-								lastElem.range = new vscode.Range (lastElem.range.start, endOfDocumentPos);
-								p = p.parent;
-							}
-						}
-					} // organizeSymbols()
-
-					function extractLevel (src: review.Symbol): number {
-						switch (src.node.ruleName) {
-							case review.RuleName.Headline:
-								return src.node.toHeadline ().level;
-							case review.RuleName.Column:
-								return src.node.toColumn ().level;
-							default:
-								return -Infinity;
-						}
-					}
-
-					function getLabelName (src: review.Symbol): string {
-
-						function getCaptionText (caption: NodeSyntaxTree): string {
-
-							function processInlineElementContent(content: NodeSyntaxTree, tokens: string[]) {
-								// InlineElementContent should have only 1 child node
-								if (content.childNodes.length === 1 ) {
-									// the child should be InlineElementContent or InlineElementContentText
-									if (content.childNodes [0].isTextNode ()) {
-										tokens.push (content.childNodes [0].toTextNode ().text);
-									} else if (content.childNodes [0].isNode ()){
-										// InlineElementContent
-										processInlineElementContent(content.childNodes [0].toNode (), tokens);
-									}
-								}
-							} // processInlineElementContent()
-
-							const tokens = [];
-							for(const child of caption.childNodes) {
-								if (child.isTextNode ()) {
-									tokens.push (child.toTextNode ().text);
-								} else if (child.isInlineElement ()) {
-									const asInline = child.toInlineElement ();
-									// InlineElement should have only 1 child node
-									if (asInline.childNodes.length === 1 && asInline.childNodes [0].isNode ()) {
-										// InlineElement's child is InlineElementContents, which have one or more InlineElementContent
-										for(const content of asInline.childNodes) {
-											if (!content. isNode()) {
-												// Skip invalid InlineElementContent
-												continue;
-											}
-
-											processInlineElementContent (content.toNode (), tokens);
-										}
-									}
-								}
-							}
-							return tokens.join ("");
-						} // getCaptionText()
-
-						switch (src.node.ruleName) {
-							case review.RuleName.Headline: {
-								const caption = getCaptionText (src.node.toHeadline ().caption);
-								return caption === src.labelName ? src.labelName : `{${src.labelName}} ${caption}`;
-							}
-							case review.RuleName.Column: {
-								const column = src.node.toColumn ();
-								const caption = getCaptionText (column.headline.caption);
-								const label = column.headline.label?.arg;
-								return (label == null || caption === label) ? `[column] ${caption}` : `[column] {${label}} ${caption}`;
-							}
-							default:
-								return undefined;
-						}
-					} // getLabelName()
-
-					function getLabelDetail (src: review.Symbol): string {
-						switch (src.node.ruleName) {
-							case review.RuleName.Headline:
-								return "headline";
-							case review.RuleName.Column:
-								return "column";
-							default:
-								return undefined;
-						}
-					}
-					const root: ReviewSymbol = {
-						level: -Infinity,
-						children: [],
-						parent: undefined
-					};
-					// filters symbols to contain only "current" document's
-					organizeSymbols (root, symbols.filter (o => o.chapter?.name == docFileName && !o.node.isInlineElement () && (o.symbolName === "hd" || o.symbolName === "column")));
-					document_symbols = root.children;
-				},
-				onReports: function (reports) {
-
-					// Organize report for chapters
-					const reportsPerFile = new Map<string, review.ProcessReport[]> ();
-					for (const report of reports) {
-						let reportsForFile = reportsPerFile.get (report.chapter.name);
-						if (reportsForFile == null) {
-							reportsForFile = [];
-							reportsPerFile.set (report.chapter.name, reportsForFile);
-						}
-
-						reportsForFile.push (report);
-					}
-
-					if (last_diagnostics != null)
-						last_diagnostics.dispose ();
-					last_diagnostics = vscode.languages.createDiagnosticCollection ("Re:VIEW validation");
-
-					for (const kv of reportsPerFile) {
-						const file = kv [0];
-						const reportsForFile = kv [1];
-
-						var dc = Array.of<vscode.Diagnostic> ();
-						for (var i = 0; i < reportsForFile.length; i++) {
-							var loc = reportsForFile [i].nodes.length > 0 ? reportsForFile [i].nodes [0].location : null;
-							dc.push (new vscode.Diagnostic (locationToRange (loc), reportsForFile [i].message, reportLevelToSeverity (reportsForFile [i].level)));
-						}
-						last_diagnostics.set (vscode.Uri.joinPath (document.uri, `../${file}`), dc);
-					}
-				},
-			},
-			builders: [ new review.HtmlBuilder (false) ],
-			book: books
-		});
-	}, options);
-}
-
-var previews = new Map<string,vscode.WebviewPanel> ();
-
-function startPreview (uri: vscode.Uri, context: vscode.ExtensionContext) {
-	if (!(uri instanceof vscode.Uri)) {
-		if (vscode.window.activeTextEditor) {
-			uri = vscode.window.activeTextEditor.document.uri;
-		}
-	}
-
-	var localResRoot = vscode.Uri.file(path.dirname(uri.fsPath));
-	var webView = vscode.window.createWebviewPanel ('vscode-language-review', "[preview]" + path.basename(uri.path), vscode.ViewColumn.Two,
-		{
-			localResourceRoots: [localResRoot]
-		});
-	previews.set(uri.fsPath, webView);
-	var doc = vscode.workspace.textDocuments.find((d,_,__) => d.uri.fsPath == uri.fsPath);
-	var getAssetUri = (...relPath: string[]) => {
-		var p = path.join (...relPath);
-		if (!path.isAbsolute(p))
-			p = path.join (context.extensionPath, p);
-		return webView.webview.asWebviewUri (vscode.Uri.file (p));
-	}
-	convert_review_doc_to_html(doc, getAssetUri).then (
-		successResult => webView.webview.html = successResult,
-		failureReason => webView.webview.html = failureReason);
-
-	var last_changed_event: vscode.TextDocumentChangeEvent = null;
-	var timer = setInterval(() => maybeUpdatePreview (last_changed_event, getAssetUri), 1000);
-	vscode.workspace.onDidChangeTextDocument (e => last_changed_event = e);
-
-	webView.onDidDispose(()=> {
-		clearInterval (timer);
-		this._webViewPanel = null;
-	});
-}
-
-function maybeUpdatePreview (e: vscode.TextDocumentChangeEvent, f: (...path: string[]) => vscode.Uri) {
-	if (e == null || e.document.uri == null)
-		return;
-	var webView = previews.get(e.document.uri.fsPath);
-	if (webView == null)
-		return;
-	convert_review_doc_to_html (e.document, f).then (
-		successResult => webView.webview.html = successResult,
-		failureReason => webView.webview.html = failureReason);
-}
-
-export function activate (context : vscode.ExtensionContext) {
-	let provider = new ReviewSymbolProvider ();
-	vscode.languages.registerDocumentSymbolProvider (review_scheme, provider);
-
-	vscode.workspace.onDidOpenTextDocument (maybeProcessDocument);
-	vscode.workspace.onDidSaveTextDocument (maybeProcessDocument);
-	let d1 = vscode.commands.registerCommand ("review.showPreview", uri => startPreview (uri, context));
-	let d2 = vscode.commands.registerCommand ("review.checkSyntax", uri => processDocument (vscode.window.activeTextEditor.document));
-	context.subscriptions.push (d1, d2, provider);
-}
-
-export function deactivate () {
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
